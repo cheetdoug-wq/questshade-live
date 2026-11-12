@@ -1,0 +1,327 @@
+name: Build QuestShade Live APK
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/questshade-live.yml'
+permissions: {}
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Write application source
+        shell: bash
+        run: |
+          mkdir -p src/main/jniLibs/arm64-v8a
+          mkdir -p .
+          cat > settings.gradle <<'QUESTSHADE_SOURCE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = 'QuestShadeLive'
+          QUESTSHADE_SOURCE
+          mkdir -p .
+          cat > build.gradle <<'QUESTSHADE_SOURCE'
+          plugins { id 'com.android.application' version '8.7.3' }
+          android {
+              namespace 'vr.questshade.live'
+              compileSdk 35
+              defaultConfig {
+                  applicationId 'vr.questshade.live'
+                  minSdk 28
+                  targetSdk 32
+                  versionCode 1
+                  versionName '0.1'
+              }
+              packaging { jniLibs { useLegacyPackaging true; keepDebugSymbols += ['**/libqsmedia.so'] } }
+          }
+          QUESTSHADE_SOURCE
+          mkdir -p .
+          cat > build-media.sh <<'QUESTSHADE_SOURCE'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          project=$(pwd)
+          src=$(mktemp -d)
+          git clone --quiet --depth 1 --branch n7.1.1 https://github.com/FFmpeg/FFmpeg.git "$src/ffmpeg"
+          cd "$src/ffmpeg"
+          tools="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          ./configure --target-os=android --arch=aarch64 --enable-cross-compile \
+            --cc="$tools/aarch64-linux-android28-clang" --ar="$tools/llvm-ar" \
+            --ranlib="$tools/llvm-ranlib" --strip="$tools/llvm-strip" --nm="$tools/llvm-nm" \
+            --disable-autodetect --disable-everything --disable-doc --disable-debug \
+            --disable-ffprobe --disable-ffplay --enable-ffmpeg --enable-pthreads --enable-network \
+            --enable-demuxer=flv --enable-muxer=flv,fifo --enable-protocol=rtmp,tcp,pipe \
+            --enable-parser=h264,aac --enable-decoder=h264,aac --enable-bsf=aac_adtstoasc,extract_extradata \
+            --extra-cflags=-fPIE --extra-ldflags="-pie -Wl,-z,max-page-size=16384"
+          make -j2 ffmpeg
+          install -m 755 ffmpeg "$project/src/main/jniLibs/arm64-v8a/libqsmedia.so"
+          git archive --format=tar.gz --prefix=ffmpeg/ -o "$project/ffmpeg-source.tar.gz" HEAD
+          QUESTSHADE_SOURCE
+          mkdir -p src/main
+          cat > src/main/AndroidManifest.xml <<'QUESTSHADE_SOURCE'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.INTERNET"/>
+            <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+            <application android:label="QuestShade Live" android:allowBackup="false" android:extractNativeLibs="true" android:theme="@android:style/Theme.Material.NoActionBar">
+              <activity android:name=".Home" android:exported="true" android:windowSoftInputMode="adjustResize">
+                <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
+              </activity>
+              <service android:name=".Relay" android:foregroundServiceType="dataSync" android:exported="false"/>
+            </application>
+          </manifest>
+          QUESTSHADE_SOURCE
+          mkdir -p src/main/java/vr/questshade/live
+          cat > src/main/java/vr/questshade/live/Home.java <<'QUESTSHADE_SOURCE'
+          package vr.questshade.live;
+
+          import android.app.*;
+          import android.os.*;
+          import android.content.*;
+          import android.net.Uri;
+          import android.graphics.Color;
+          import android.view.*;
+          import android.widget.*;
+          import java.io.*;
+          import java.nio.charset.StandardCharsets;
+
+          public class Home extends Activity {
+              private LinearLayout page;
+              private TextView status;
+              private EditText key;
+              private Button start,stop;
+              private final Handler handler = new Handler(Looper.getMainLooper());
+              private final Runnable refresh = new Runnable() { public void run() {
+                  status.setText(Relay.status); start.setEnabled(!Relay.active); stop.setEnabled(Relay.active);
+                  handler.postDelayed(this,500);
+              }};
+              private TextView label(String s,int size) {
+                  TextView t=new TextView(this); t.setText(s); t.setTextSize(size);
+                  t.setPadding(0,14,0,12); page.addView(t); return t;
+              }
+              private Button button(String s, View.OnClickListener action) {
+                  Button b=new Button(this); b.setText(s); b.setAllCaps(false); page.addView(b); b.setOnClickListener(action); return b;
+              }
+              public void onCreate(Bundle state) {
+                  super.onCreate(state);
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
+                  ScrollView scroll=new ScrollView(this); page=new LinearLayout(this); page.setOrientation(1);
+                  int pad=(int)(24*getResources().getDisplayMetrics().density);
+                  page.setPadding(pad,pad,pad,pad); page.setBackgroundColor(Color.rgb(21,23,30));
+                  scroll.addView(page); setContentView(scroll);
+                  label("QuestShade Live",28);
+                  label("Restream event key",16); key=new EditText(this);
+                  key.setSingleLine(true); key.setInputType(129); key.setSaveEnabled(false);
+                  key.setHint(getSharedPreferences("live",0).contains("key")?"Saved • paste here to replace":"Paste once");
+                  page.addView(key);
+                  start=button("Start relay",v->{
+                      String entered=key.getText().toString().trim();
+                      String selected=entered.isEmpty()?getSharedPreferences("live",0).getString("key",""):entered;
+                      if(selected.isEmpty() || selected.matches(".*\\s.*") || selected.contains("://") || selected.indexOf("re_",3)>=0) {
+                          key.setError("Paste one Restream event key"); return;
+                      }
+                      getSharedPreferences("live",0).edit().putString("key",selected).apply();
+                      key.setText(""); key.setHint("Saved • paste here to replace");
+                      startForegroundService(new Intent(this,Relay.class));
+                  });
+                  stop=button("Stop relay",v->{ Relay.status="Stopped"; stopService(new Intent(this,Relay.class)); });
+                  status=label("",17);
+                  button("Open Twitch chat",v->{
+                      EditText channel=new EditText(this); channel.setSingleLine(true);
+                      channel.setHint("Twitch channel name"); channel.setText(getSharedPreferences("live",0).getString("channel",""));
+                      new AlertDialog.Builder(this).setTitle("Twitch chat in Quest Browser").setView(channel)
+                          .setPositiveButton("Open chat",(dialog,which)->{
+                              String name=channel.getText().toString().trim();
+                              if(!name.matches("[a-zA-Z0-9_]{1,25}")){note("Enter a Twitch channel name.");return;}
+                              getSharedPreferences("live",0).edit().putString("channel",name).apply();
+                              try{startActivity(new Intent(Intent.ACTION_VIEW,Uri.parse("https://www.twitch.tv/popout/"+name+"/chat")));}
+                              catch(ActivityNotFoundException e){note("Open your channel's chat in Quest Browser.");}
+                          }).setNegativeButton("Cancel",null).show();
+                  });
+                  button("Set camera target to 60 FPS",v->new AlertDialog.Builder(this)
+                      .setMessage("Close BONELAB, then select its QuestShade.ini file. This sets 480p at 60 FPS, turns off the camera preview and keeps your FOV. The actual frame rate depends on the game.")
+                      .setPositiveButton("Choose file",(d,w)->pick(60)).setNegativeButton("Cancel",null).show());
+                  button("Restore previous camera settings",v->pick(61));
+              }
+              private void pick(int code) {
+                  Intent i=new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*");
+                  try {startActivityForResult(i,code);} catch(ActivityNotFoundException e){note("This headset has no system file picker.");}
+              }
+              private String read(InputStream input) throws IOException {
+                  if(input==null) throw new IOException("Cannot read file");
+                  try(InputStream in=input; ByteArrayOutputStream out=new ByteArrayOutputStream()){
+                      byte[] b=new byte[4096]; int n;
+                      while((n=in.read(b))!=-1){out.write(b,0,n); if(out.size()>524288) throw new IOException("File too large");}
+                      return out.toString("UTF-8");
+                  }
+              }
+              private void write(Uri uri,String data) throws IOException {
+                  try(OutputStream out=getContentResolver().openOutputStream(uri,"wt")){
+                      if(out==null) throw new IOException("Cannot write settings"); out.write(data.getBytes(StandardCharsets.UTF_8));
+                  }
+              }
+              protected void onActivityResult(int code,int result,Intent data) {
+                  super.onActivityResult(code,result,data);
+                  if((code!=60 && code!=61)||result!=RESULT_OK||data==null||data.getData()==null)return;
+                  Uri uri=data.getData(); SharedPreferences prefs=getSharedPreferences("camera",0);
+                  String id=uri.toString();
+                  try{
+                      String original=read(getContentResolver().openInputStream(uri));
+                      String replacement;
+                      if(code==60){
+                          replacement=Profile.apply(original);
+                          if(!prefs.contains(id) && !prefs.edit().putString(id,original).commit()) throw new IOException("Backup failed");
+                      }else{
+                          replacement=prefs.getString(id,null);
+                          if(replacement==null){note("Select the same QuestShade.ini you changed before.");return;}
+                      }
+                      try{
+                          write(uri,replacement);
+                          if(!read(getContentResolver().openInputStream(uri)).equals(replacement)) throw new IOException("Write verification failed");
+                      }catch(IOException problem){write(uri,original);throw problem;}
+                      if(code==61)prefs.edit().remove(id).apply();
+                      note(code==60?"60 FPS target saved. Reopen BONELAB.":"Previous settings restored.");
+                  }catch(Exception e){note("Settings change failed. "+e.getMessage());}
+              }
+              private void note(String msg){new AlertDialog.Builder(this).setMessage(msg).setPositiveButton("OK",null).show();}
+              protected void onResume(){super.onResume();refresh.run();}
+              protected void onPause(){handler.removeCallbacks(refresh);super.onPause();}
+          }
+          QUESTSHADE_SOURCE
+          mkdir -p src/main/java/vr/questshade/live
+          cat > src/main/java/vr/questshade/live/Profile.java <<'QUESTSHADE_SOURCE'
+          package vr.questshade.live;
+
+          import java.util.*;
+          import java.util.regex.*;
+
+          final class Profile {
+              static String apply(String ini) {
+                  Map<String,String> values = new LinkedHashMap<>();
+                  values.put("RecordQuality","480p"); values.put("RecordFps","60");
+                  values.put("RecordSupersample","1.0"); values.put("RecordBitrate","2000");
+                  values.put("Preview","false");
+                  Matcher section = Pattern.compile("(?ims)^\\[Camera\\][ \\t]*\\r?\\n(.*?)(?=^\\[|\\z)").matcher(ini);
+                  if (!section.find()) throw new IllegalArgumentException("Choose QuestShade.ini with a Camera section.");
+                  String body = section.group(1);
+                  if (!Pattern.compile("(?im)^\\s*RecordQuality\\s*=").matcher(body).find())
+                      throw new IllegalArgumentException("This file does not look like the QuestShade camera configuration.");
+                  String newline = ini.contains("\r\n") ? "\r\n" : "\n";
+                  for (Map.Entry<String,String> entry : values.entrySet()) {
+                      Pattern key = Pattern.compile("(?im)^([ \\t]*"+entry.getKey()+"[ \\t]*=[ \\t]*)[^;\\r\\n]*");
+                      Matcher match = key.matcher(body);
+                      if (match.find()) body = match.replaceAll("$1"+Matcher.quoteReplacement(entry.getValue()+" "));
+                      else body += newline+entry.getKey()+"="+entry.getValue()+newline;
+                  }
+                  return ini.substring(0,section.start(1))+body+ini.substring(section.end(1));
+              }
+          }
+          QUESTSHADE_SOURCE
+          mkdir -p src/main/java/vr/questshade/live
+          cat > src/main/java/vr/questshade/live/Relay.java <<'QUESTSHADE_SOURCE'
+          package vr.questshade.live;
+
+          import android.app.*;
+          import android.content.Intent;
+          import android.os.IBinder;
+          import java.io.*;
+          import java.util.concurrent.atomic.AtomicBoolean;
+
+          public class Relay extends Service {
+              static volatile String status = "Stopped";
+              static volatile boolean active;
+              private final AtomicBoolean stopping = new AtomicBoolean();
+              private volatile Process media;
+              private volatile Thread worker;
+              static String[] command(String binary, String key) {
+                  return new String[]{binary, "-nostdin", "-hide_banner", "-loglevel", "warning",
+                      "-nostats", "-progress", "pipe:1", "-thread_queue_size", "256",
+                      "-use_wallclock_as_timestamps", "1", "-fflags", "+genpts", "-f", "flv",
+                      "-i", "tcp://127.0.0.1:19350?listen=1", "-map", "0:v:0", "-map", "0:a:0?",
+                      "-c", "copy", "-avoid_negative_ts", "make_zero", "-f", "fifo",
+                      "-fifo_format", "flv", "-queue_size", "180", "-drop_pkts_on_overflow", "1",
+                      "-restart_with_keyframe", "1", "-attempt_recovery", "1", "-recovery_wait_time", "2",
+                      "-max_recovery_attempts", "3", "rtmp://live.restream.io/live/" + key};
+              }
+              public int onStartCommand(Intent request, int flags, int id) {
+                  if (worker != null) return START_NOT_STICKY;
+                  NotificationManager nm = getSystemService(NotificationManager.class);
+                  nm.createNotificationChannel(new NotificationChannel("relay","Camera relay",NotificationManager.IMPORTANCE_LOW));
+                  startForeground(1, new Notification.Builder(this,"relay")
+                      .setSmallIcon(android.R.drawable.presence_video_online).setContentTitle("QuestShade Live")
+                      .setContentText("Camera relay running").setContentIntent(PendingIntent.getActivity(this,0,
+                          new Intent(this,Home.class),PendingIntent.FLAG_IMMUTABLE)).build());
+                  active = true;
+                  status = "Waiting for QuestShade. In BONELAB, enable Send next recording to relay and start recording.";
+                  worker = new Thread(() -> runRelay(id), "camera-relay");
+                  worker.start();
+                  return START_NOT_STICKY;
+              }
+              private void runRelay(int id) {
+                  String outcome = "Camera feed ended. Stop the current recording before starting again.";
+                  try {
+                      String bin = new File(getApplicationInfo().nativeLibraryDir,"libqsmedia.so").getPath();
+                      Process p = new ProcessBuilder(command(bin,getSharedPreferences("live",0).getString("key","")))
+                          .redirectErrorStream(true).start();
+                      media = p;
+                      if (stopping.get()) p.destroyForcibly();
+                      try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+                          String line;
+                          while ((line=r.readLine()) != null) {
+                              if (line.startsWith("frame=") && !stopping.get())
+                                  status = "Camera frames processed: " + line.substring(6).trim()
+                                      + ". Confirm live video on your Twitch channel.";
+                              if (line.contains("Address already in use")) outcome = "Camera port is busy. Stop the Termux relay and retry.";
+                              else if (line.contains("Error opening output") || line.contains("Recovery failed"))
+                                  outcome = "Output connection failed. Check the Restream key for this event and your Wi-Fi.";
+                              else if (line.contains("queue overflow") || line.contains("FIFO queue full"))
+                                  status = "Upload fell behind. Dropping queued frames to keep the game feed moving.";
+                          }
+                      }
+                      if (p.waitFor()!=0 && outcome.startsWith("Camera feed ended"))
+                          outcome = "Relay stopped with an error. Check the event key, network and camera relay.";
+                  } catch (Exception e) {
+                      outcome = "Could not run the bundled relay on this headset.";
+                  } finally {
+                      if (!stopping.get()) status = outcome;
+                      stopSelf(id);
+                  }
+              }
+              public void onDestroy() {
+                  stopping.set(true);
+                  Process p=media;
+                  if (p!=null && p.isAlive()) p.destroyForcibly();
+                  active=false;
+                  super.onDestroy();
+              }
+              public IBinder onBind(Intent i) { return null; }
+          }
+          QUESTSHADE_SOURCE
+      - name: Build arm64 relay and Android app
+        shell: bash
+        run: |
+          sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;27.2.12479018'
+          bash build-media.sh
+          gradle --no-daemon assembleDebug
+          apk=$(find build/outputs/apk/debug -name '*.apk' -print -quit)
+          cp "$apk" QuestShade-Live.apk
+          unzip -Z1 QuestShade-Live.apk | grep -Fx lib/arm64-v8a/libqsmedia.so
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify QuestShade-Live.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: QuestShade-Live-APK
+          path: QuestShade-Live.apk
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Relay-library-source
+          path: |
+            ffmpeg-source.tar.gz
+            build-media.sh
